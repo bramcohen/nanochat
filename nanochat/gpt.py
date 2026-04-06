@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+from typing import NewType
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,24 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+
+# Semantic types for tensors in the forward pass.
+# Same representation (torch.Tensor), different geometric roles.
+#
+# Point — a point in geometric space:
+#   scalar * point → point
+#   point + point → point
+#   dot(point, point) → scalar
+#   magnitude(point) → scalar   (L2 norm)
+#   point / scalar → point      (norm preserves point-ness)
+#   point[..., a:b] → point     (slicing preserves point-ness)
+#
+# Scalar — plain scalar(s), standard arithmetic:
+#   all standard ops (add, mul, div, etc.)
+#   scalar * point → point
+#
+Point = NewType('Point', torch.Tensor)
+Scalar = NewType('Scalar', torch.Tensor)
 
 @dataclass
 class GPTConfig:
@@ -39,7 +58,8 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
-def norm(x):
+def norm(x: torch.Tensor) -> torch.Tensor:
+    """RMS normalization. Preserves type: point → point, scalar → scalar."""
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
 class Linear(nn.Linear):
@@ -54,7 +74,7 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-def apply_rotary_emb(x, cos, sin):
+def apply_rotary_emb(x: Scalar, cos: Scalar, sin: Scalar) -> Scalar:
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
@@ -79,50 +99,45 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x: Point, ve: Point | None, cos_sin: tuple[Scalar, Scalar], window_size: tuple[int, int], kv_cache) -> Point:
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Project point → scalar[] via dot(point_rows, point_input) per row
+        q: Scalar = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k: Scalar = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v: Scalar = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # Scalar[] → scalar[] (elementwise scalar arithmetic with cos/sin tables)
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # Attention: scalar[] × scalar[] → scalar[] (scalar weights × scalar values, summed)
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y: Scalar = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+            y: Scalar = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
-        # Re-assemble the heads and project back to residual stream
+        # scalar[] × point_rows → point (weighted sum of point rows)
         y = y.contiguous().view(B, T, -1)
-        y = F.linear(y, self.c_proj.to(y.dtype).T)
-        # Value residual (ResFormer): add value embedding in point space with input-dependent gate per head
+        y_point: Point = F.linear(y, self.c_proj.to(y.dtype).T)
+        # Value residual (ResFormer): add point embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            y = y + (gate.unsqueeze(-1) * ve).view(B, T, -1)
-        return y
+            gate: Scalar = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            y_point = y_point + (gate.unsqueeze(-1) * ve).view(B, T, -1)  # point + scalar*point → point
+        return y_point
 
 
 class MLP(nn.Module):
@@ -131,11 +146,10 @@ class MLP(nn.Module):
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Parameter(torch.empty(4 * config.n_embd, config.n_embd))
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = F.linear(x, self.c_proj.to(x.dtype).T)
-        return x
+    def forward(self, x: Point) -> Point:
+        h: Scalar = self.c_fc(x)          # point → scalar[] (dot product projection)
+        h = F.relu(h).square()             # scalar[] → scalar[]
+        return F.linear(h, self.c_proj.to(h.dtype).T) # scalar[] × point_rows → point
 
 
 class Block(nn.Module):
@@ -144,9 +158,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+    def forward(self, x: Point, ve: Point | None, cos_sin: tuple[Scalar, Scalar], window_size: tuple[int, int], kv_cache) -> Point:
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)  # point + point → point
+        x = x + self.mlp(norm(x))                                        # point + point → point
         return x
 
 
@@ -412,7 +426,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, kv_cache=None, loss_reduction: str = 'mean') -> Scalar:
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -421,62 +435,55 @@ class GPT(nn.Module):
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos_sin: tuple[Scalar, Scalar] = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
-        x = norm(x)
+        # Embed the tokens: lookup → point
+        x: Point = self.transformer.wte(idx)
+        x = x.to(COMPUTE_DTYPE)
+        x = norm(x)  # point → point (scalar division)
 
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
+        # Smear: scalar * point + point → point (cheap bigram info)
         if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            gate: Scalar = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
-            # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                gate: Scalar = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
             elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+                gate: Scalar = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
+                x = x + gate * x_pre_smear  # point + scalar*point → point
 
         # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
+        x0: Point = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
-        x_backout = None
+        backout_layer = n_layer // 2
+        x_backout: Point | None = None
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0  # scalar*point + scalar*point → point
+            ve: Point | None = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
+        # point + scalar*point → point
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        x = norm(x)  # point → point
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        # point → scalar[] via dot(point_rows, point) per row
+        softcap = 15
+        logits: Scalar = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)  # scalar → scalar
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss: Scalar = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
-            # inference: just return the logits directly
             return logits
 
     @torch.inference_mode()
